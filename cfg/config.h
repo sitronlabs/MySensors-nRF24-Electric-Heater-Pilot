@@ -5,9 +5,9 @@
 #define MY_DEBUG
 #define MY_REPEATER_FEATURE
 #define MY_RADIO_RF24
-#define MY_RF24_CHANNEL 124
 #define MY_RF24_CE_PIN 9
 #define MY_RF24_CS_PIN 10
+#define MY_RF24_PA_LEVEL RF24_PA_MAX
 
 /*  */
 #define CONFIG_PERIPH_LED_RED_PIN 7

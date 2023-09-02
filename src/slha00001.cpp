@@ -7,13 +7,20 @@
 #include <Wire.h>
 #include <aht20.h>
 
-/* Volative working variables */
-static bool m_heating_enabled = false;
-static float m_heating_target = 19.0;
+/* Peripherals */
 static aht20 m_sensor;
-static float m_temperature_offset = 0;
-static float m_temperature = 0;
-static float m_humidity = 0;
+
+/* Work data */
+static bool m_heating_enabled = false;
+static uint32_t m_heating_timestamp;
+static float m_temperature_target = 19.0;
+static float m_temperature_measured = 0;
+static float m_temperature_reported = 0;
+static uint32_t m_temperature_report_timestamp = 0;
+static float m_humidity_measured = 0;
+static float m_humidity_reported = 0;
+static uint32_t m_humidity_report_timestamp = 0;
+static bool m_hvac_report_needed = true;
 
 /* Wireless messages */
 static MyMessage m_message_mode(0, V_HVAC_FLOW_STATE);
@@ -22,28 +29,43 @@ static MyMessage m_message_temperature_measured(0, V_TEMP);
 static MyMessage m_message_humidity_measured(1, V_HUM);
 
 /**
- *
+ * Setup function.
+ * Called before MySensors does anything.
+ */
+void preHwInit(void) {
+
+    /* Setup leds */
+    pinMode(CONFIG_PERIPH_LED_RED_PIN, OUTPUT);
+    pinMode(CONFIG_PERIPH_LED_YELLOW_PIN, OUTPUT);
+    pinMode(CONFIG_PERIPH_LED_GREEN_PIN, OUTPUT);
+    digitalWrite(CONFIG_PERIPH_LED_RED_PIN, LOW);
+    digitalWrite(CONFIG_PERIPH_LED_YELLOW_PIN, HIGH);
+    digitalWrite(CONFIG_PERIPH_LED_GREEN_PIN, LOW);
+}
+
+/**
+ * Called when setup() encounters an error.
  */
 void setup_failed(const char *const reason) {
+
+    /* Turn on error led */
+    digitalWrite(CONFIG_PERIPH_LED_RED_PIN, HIGH);
+
+    /* Print failure message */
     Serial.println(reason);
     Serial.flush();
+
+    /* Wait forever */
     while (1) {
         sleep(0, false);
     }
 }
 
 /**
- *
+ * Setup function.
+ * Called once MySensors has successfully initialized.
  */
 void setup() {
-
-    /* Setup leds */
-    pinMode(CONFIG_PERIPH_LED_RED_PIN, OUTPUT);
-    pinMode(CONFIG_PERIPH_LED_YELLOW_PIN, OUTPUT);
-    pinMode(CONFIG_PERIPH_LED_GREEN_PIN, OUTPUT);
-    digitalWrite(CONFIG_PERIPH_LED_RED_PIN, HIGH);
-    digitalWrite(CONFIG_PERIPH_LED_YELLOW_PIN, HIGH);
-    digitalWrite(CONFIG_PERIPH_LED_GREEN_PIN, LOW);
 
     /* Setup serial */
     Serial.begin(115200);
@@ -65,9 +87,10 @@ void setup() {
     digitalWrite(CONFIG_PERIPH_HEATER_TRIAC_N_PIN, HIGH);
     digitalWrite(CONFIG_PERIPH_HEATER_TRIAC_P_PIN, LOW);
 
-    /* Turn off red and yellow led to indicate setup done */
+    /* Turn off leds to indicate setup done */
     digitalWrite(CONFIG_PERIPH_LED_RED_PIN, LOW);
     digitalWrite(CONFIG_PERIPH_LED_YELLOW_PIN, LOW);
+    digitalWrite(CONFIG_PERIPH_LED_GREEN_PIN, LOW);
 }
 
 /**
@@ -75,9 +98,12 @@ void setup() {
  * @note Ideally, this sensor should present itself as a S_HEATER, but currently only S_HVAC is supported by Home Assistant.
  */
 void presentation() {
-    sendSketchInfo("SLHA00001 Electric Heater", "0.1.0");
-    present(0, S_HVAC);  // V_STATUS, V_TEMP, V_HVAC_SETPOINT_HEAT, V_HVAC_SETPOINT_COOL, V_HVAC_FLOW_STATE, V_HVAC_FLOW_MODE, V_HVAC_SPEED
-    present(1, S_HUM);   // V_HUM
+    bool res = true;
+    do {
+        res &= sendSketchInfo(F("SLHA00001 Electric Heater"), F("0.2.0"));
+        res &= present(0, S_HVAC, F("Heater"));   // V_STATUS, V_TEMP, V_HVAC_SETPOINT_HEAT, V_HVAC_SETPOINT_COOL, V_HVAC_FLOW_STATE, V_HVAC_FLOW_MODE, V_HVAC_SPEED
+        res &= present(1, S_HUM, F("Humidity"));  // V_HUM
+    } while (res != true);
 }
 
 /**
@@ -89,36 +115,26 @@ void receive(const MyMessage &message) {
     if (message.getType() == V_HVAC_SETPOINT_HEAT) {
         float target = message.getFloat();
         if (target < 0 || target > 40) {
-            Serial.println(" [e] Received invalid target!");
+            Serial.println(F(" [e] Received invalid target!"));
             return;
         }
-        m_heating_target = target;
-        Serial.print(" [i] Receveid new target of ");
+        m_temperature_target = target;
+        m_hvac_report_needed = true;
+        Serial.print(F(" [i] Receveid new target of "));
         Serial.println(target);
     }
 
     /* Handle heater on/off messages */
     else if (message.getType() == V_HVAC_FLOW_STATE) {
         m_heating_enabled = (strcmp(message.getString(), "HeatOn") == 0 || strcmp(message.getString(), "AutoChangeOver") == 0) ? true : false;
-        Serial.print(" [i] Receveid state ");
-        Serial.println(m_heating_enabled ? "on" : "off");
-    }
-
-    /* */
-    else if (message.getType() == V_VAR1) {
-        float offset = message.getFloat();
-        if (fabs(offset) <= 5) {
-            m_temperature_offset = offset;
-            Serial.print(" [e] Received new offset of ");
-            Serial.println(offset);
-        } else {
-            Serial.println(" [e] Received invalid offset!");
-        }
+        m_hvac_report_needed = true;
+        Serial.print(F(" [i] Receveid state "));
+        Serial.println(m_heating_enabled ? F("on") : F("off"));
     }
 
     /* Handler other messages */
     else {
-        Serial.print(" [e] Unexpected message type ");
+        Serial.print(F(" [e] Unexpected message type "));
         Serial.println(message.getType(), DEC);
     }
 }
@@ -131,91 +147,118 @@ void loop() {
 
     /* State machine */
     static enum {
-        STATE_0,
-        STATE_1,
-        STATE_2,
-        STATE_3,
-        STATE_ERROR,
-    } s_sm;
-    switch (s_sm) {
+        STATE_READ_0,
+        STATE_REPORT_0,
+        STATE_HEAT_0,
+        STATE_HEAT_1,
+        STATE_ERROR_0,
+        STATE_ERROR_1,
+    } m_sm;
+    switch (m_sm) {
 
-        case STATE_0: {
+        case STATE_READ_0: {
 
-            /* Reset red error led and
-             * turn on green activity led */
-            digitalWrite(CONFIG_PERIPH_LED_RED_PIN, LOW);
-            digitalWrite(CONFIG_PERIPH_LED_GREEN_PIN, HIGH);
-
-            /* Move on */
-            s_sm = STATE_1;
-            break;
-        }
-
-        case STATE_1: {
-
-            /* Read temperature */
-            res = m_sensor.measurement_sync_get(&m_temperature, &m_humidity);
+            /* Read temperature and humidity */
+            res = m_sensor.measurement_sync_get(m_temperature_measured, m_humidity_measured);
             if (res < 0) {
-                Serial.println(" [e] Failed to read from temperature sensor!");
-                s_sm = STATE_ERROR;
+                Serial.println(F(" [e] Failed to read from temperature sensor!"));
+                m_sm = STATE_ERROR_0;
                 return;
             }
 
-            /* Apply temperature offset */
-            m_temperature += m_temperature_offset;
-
             /* Move on */
-            s_sm = STATE_2;
+            m_sm = STATE_REPORT_0;
             break;
         }
 
-        case STATE_2: {
+        case STATE_REPORT_0: {
 
-            /* Report info */
-            send(m_message_mode.set(m_heating_enabled ? "HeatOn" : "Off"));
-            send(m_message_temperature_target.set(m_heating_target, 2));
-            send(m_message_temperature_measured.set(m_temperature, 2));
-            send(m_message_humidity_measured.set(m_humidity * 100, 2));
-
-            /* Move on */
-            s_sm = STATE_3;
-            break;
-        }
-
-        case STATE_3: {
-
-            /* Turn off green activity led */
-            digitalWrite(CONFIG_PERIPH_LED_GREEN_PIN, LOW);
-
-            /* Generate signal */
-            if (m_heating_enabled && m_temperature <= m_heating_target) {
-                digitalWrite(CONFIG_PERIPH_HEATER_TRIAC_P_PIN, LOW);
-                digitalWrite(CONFIG_PERIPH_HEATER_TRIAC_N_PIN, LOW);
-            } else {
-                digitalWrite(CONFIG_PERIPH_HEATER_TRIAC_P_PIN, LOW);
-                digitalWrite(CONFIG_PERIPH_HEATER_TRIAC_N_PIN, HIGH);
+            /* Attempt to report temperature */
+            if (fabs(m_temperature_measured - m_temperature_reported) >= 0.1 &&                          // Significant change
+                (m_hvac_report_needed == true || millis() - m_temperature_report_timestamp >= 30000)) {  // Rate limiting
+                if (send(m_message_temperature_measured.set(m_temperature_measured, 1)) == true) {
+                    m_temperature_reported = m_temperature_measured;
+                    m_temperature_report_timestamp = millis();
+                }
             }
 
-            /* Sleep */
-            wait(10000);
-            s_sm = STATE_0;
+            /* Attempt to report humidity */
+            if (fabs(m_humidity_measured - m_humidity_reported) >= 0.5 &&                             // Significant change
+                (m_hvac_report_needed == true || millis() - m_humidity_report_timestamp >= 30000)) {  // Rate limiting
+                if (send(m_message_humidity_measured.set(m_humidity_measured, 1)) == true) {
+                    m_humidity_reported = m_humidity_measured;
+                    m_humidity_report_timestamp = millis();
+                }
+            }
+
+            /* Attempt to report hvac status if needed */
+            if (m_hvac_report_needed == true) {
+                if (send(m_message_mode.set(m_heating_enabled ? F("HeatOn") : F("Off"))) == true &&  //
+                    send(m_message_temperature_target.set(m_temperature_target, 1)) == true) {
+                    m_hvac_report_needed = false;
+                }
+            }
+
+            /* Move on */
+            m_sm = STATE_HEAT_0;
             break;
         }
 
-        case STATE_ERROR:
-        default: {
+        case STATE_HEAT_0: {
+
+            /* Stop here if there is no need to heat */
+            if (m_heating_enabled == false || m_temperature_measured > m_temperature_target) {
+                digitalWrite(CONFIG_PERIPH_HEATER_TRIAC_P_PIN, LOW);
+                digitalWrite(CONFIG_PERIPH_HEATER_TRIAC_N_PIN, HIGH);
+                m_sm = STATE_READ_0;
+                break;
+            }
+
+            /* Turn on heating */
+            digitalWrite(CONFIG_PERIPH_HEATER_TRIAC_P_PIN, LOW);
+            digitalWrite(CONFIG_PERIPH_HEATER_TRIAC_N_PIN, LOW);
+
+            /* Move on */
+            m_heating_timestamp = millis();
+            m_sm = STATE_HEAT_1;
+            break;
+        }
+
+        case STATE_HEAT_1: {
+
+            /* Wait 10 seconds */
+            if (millis() - m_heating_timestamp < 10000) {
+                break;
+            }
+
+            /* Move on */
+            m_sm = STATE_READ_0;
+            break;
+        }
+
+        case STATE_ERROR_0: {
 
             /* Turn off heating */
-            m_heating_enabled = false;
             digitalWrite(CONFIG_PERIPH_HEATER_TRIAC_P_PIN, LOW);
             digitalWrite(CONFIG_PERIPH_HEATER_TRIAC_N_PIN, HIGH);
 
-            /* Light up error led */
+            /* Turn on error led */
             digitalWrite(CONFIG_PERIPH_LED_RED_PIN, HIGH);
 
-            /* Sleep before retrying */
-            wait(60000);
-            s_sm = STATE_0;
+            /* Move on */
+            m_heating_timestamp = millis();
+            break;
+        }
+
+        case STATE_ERROR_1: {
+
+            /* Wait 10 seconds */
+            if (millis() - m_heating_timestamp < 10000) {
+                break;
+            }
+
+            /* Move on */
+            m_sm = STATE_READ_0;
             break;
         }
     }
