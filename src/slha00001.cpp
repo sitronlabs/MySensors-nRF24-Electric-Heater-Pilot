@@ -22,6 +22,12 @@ static float m_humidity_reported = 0;
 static uint32_t m_humidity_report_timestamp = 0;
 static bool m_hvac_report_needed = true;
 
+/* List of virtual sensors */
+enum {
+    SENSOR_0_HEATER,    // S_HVAC (V_STATUS, V_TEMP, V_HVAC_SETPOINT_HEAT, V_HVAC_SETPOINT_COOL, V_HVAC_FLOW_STATE, V_HVAC_FLOW_MODE, V_HVAC_SPEED)
+    SENSOR_1_HUMIDITY,  // S_HUM (V_HUM)
+};
+
 /* Wireless messages */
 static MyMessage m_message_mode(0, V_HVAC_FLOW_STATE);
 static MyMessage m_message_temperature_target(0, V_HVAC_SETPOINT_HEAT);
@@ -98,12 +104,42 @@ void setup() {
  * @note Ideally, this sensor should present itself as a S_HEATER, but currently only S_HVAC is supported by Home Assistant.
  */
 void presentation() {
-    bool res = true;
-    do {
-        res &= sendSketchInfo(F("SLHA00001 Electric Heater"), F("0.2.0"));
-        res &= present(0, S_HVAC, F("Heater"));   // V_STATUS, V_TEMP, V_HVAC_SETPOINT_HEAT, V_HVAC_SETPOINT_COOL, V_HVAC_FLOW_STATE, V_HVAC_FLOW_MODE, V_HVAC_SPEED
-        res &= present(1, S_HUM, F("Humidity"));  // V_HUM
-    } while (res != true);
+
+    /* Because messages might be lost,
+     * we're not doing the presentation in one block, but rather step by step,
+     * making sure each step is sucessful before advancing to the next */
+    for (int8_t step = -1;;) {
+
+        /* Send out presentation information corresponding to the current step,
+         * and advance one step if successful */
+        switch (step) {
+            case -1: {
+                if (sendSketchInfo(F("SLHA00001 Electric Heater"), F("0.2.0")) == true) {
+                    step++;
+                }
+                break;
+            }
+            case SENSOR_0_HEATER: {
+                if (present(SENSOR_0_HEATER, S_HVAC, F("Chauffage")) == true) {  // V_STATUS, V_TEMP, V_HVAC_SETPOINT_HEAT, V_HVAC_SETPOINT_COOL, V_HVAC_FLOW_STATE, V_HVAC_FLOW_MODE, V_HVAC_SPEED
+                    step++;
+                }
+                break;
+            }
+            case SENSOR_1_HUMIDITY: {
+                if (present(SENSOR_1_HUMIDITY, S_HUM, F("Humidité")) == true) {  // V_HUM
+                    step++;
+                }
+                break;
+            }
+            default: {
+                return;
+            }
+        }
+
+        /* Sleep a little bit after each presentation, otherwise the next fails
+         * @see https://forum.mysensors.org/topic/4450/sensor-presentation-failure */
+        sleep(50);
+    }
 }
 
 /**
@@ -112,7 +148,7 @@ void presentation() {
 void receive(const MyMessage &message) {
 
     /* Handle heater setpoint messages */
-    if (message.getType() == V_HVAC_SETPOINT_HEAT) {
+    if ((message.sensor == SENSOR_0_HEATER) && (message.getType() == V_HVAC_SETPOINT_HEAT)) {
         float target = message.getFloat();
         if (target < 0 || target > 40) {
             Serial.println(F(" [e] Received invalid target!"));
@@ -125,7 +161,7 @@ void receive(const MyMessage &message) {
     }
 
     /* Handle heater on/off messages */
-    else if (message.getType() == V_HVAC_FLOW_STATE) {
+    else if ((message.sensor == SENSOR_0_HEATER) && (message.getType() == V_HVAC_FLOW_STATE)) {
         m_heating_enabled = (strcmp(message.getString(), "HeatOn") == 0 || strcmp(message.getString(), "AutoChangeOver") == 0) ? true : false;
         m_hvac_report_needed = true;
         Serial.print(F(" [i] Receveid state "));
@@ -174,8 +210,8 @@ void loop() {
         case STATE_REPORT_0: {
 
             /* Attempt to report temperature */
-            if (fabs(m_temperature_measured - m_temperature_reported) >= 0.1 &&                          // Significant change
-                (m_hvac_report_needed == true || millis() - m_temperature_report_timestamp >= 30000)) {  // Rate limiting
+            if ((m_hvac_report_needed == true) ||  //
+                ((fabs(m_temperature_measured - m_temperature_reported) >= 0.1) && (millis() - m_temperature_report_timestamp >= 30000))) {
                 if (send(m_message_temperature_measured.set(m_temperature_measured, 1)) == true) {
                     m_temperature_reported = m_temperature_measured;
                     m_temperature_report_timestamp = millis();
@@ -183,8 +219,8 @@ void loop() {
             }
 
             /* Attempt to report humidity */
-            if (fabs(m_humidity_measured - m_humidity_reported) >= 0.5 &&                             // Significant change
-                (m_hvac_report_needed == true || millis() - m_humidity_report_timestamp >= 30000)) {  // Rate limiting
+            if ((m_hvac_report_needed == true) ||  //
+                ((fabs(m_humidity_measured - m_humidity_reported) >= 0.5) && (millis() - m_humidity_report_timestamp >= 30000))) {
                 if (send(m_message_humidity_measured.set(m_humidity_measured, 1)) == true) {
                     m_humidity_reported = m_humidity_measured;
                     m_humidity_report_timestamp = millis();
