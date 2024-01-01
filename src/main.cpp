@@ -1,6 +1,3 @@
-/* Config */
-#include "../cfg/config.h"
-
 /* Arduino Libraries */
 #include <Arduino.h>
 #include <MySensors.h>
