@@ -106,7 +106,7 @@ void presentation() {
          * and advance one step if successful */
         switch (step) {
             case -1: {
-                if (sendSketchInfo(F("SLHA00001 Electric Heater"), F("0.2.0")) == true) {
+                if (sendSketchInfo(F("SLHA00001 Electric Heater"), F("0.3.0")) == true) {
                     step++;
                 }
                 break;
